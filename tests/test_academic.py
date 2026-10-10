@@ -1,6 +1,8 @@
+import io
 from http import HTTPStatus
 from uuid import UUID, uuid4
 
+import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -470,3 +472,141 @@ async def test_academic_models_integrity(
         )
     )
     assert remaining_link is None
+
+
+# --- Testes de Exportação de Pesquisadores ---
+
+
+def test_export_researchers_unauthorized(client):
+    response = client.get("/academic/researchers/export")
+    assert response.status_code == HTTPStatus.UNAUTHORIZED
+
+
+def test_export_researchers_forbidden_for_default_user(client, token):
+    response = client.get(
+        "/academic/researchers/export",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == HTTPStatus.FORBIDDEN
+
+
+@pytest.mark.asyncio
+async def test_export_researchers_empty(admin_client):
+    # CSV vazio
+    response_csv = admin_client.get("/academic/researchers/export")
+    assert response_csv.status_code == HTTPStatus.OK
+    assert "text/csv" in response_csv.headers["content-type"]
+    assert (
+        'attachment; filename="researchers_lattes_ids.csv"'
+        in response_csv.headers["content-disposition"]
+    )
+    lines = [
+        line.strip() for line in response_csv.text.strip().splitlines() if line.strip()
+    ]
+    assert lines == ["lattes_id"]
+
+    # Parquet vazio
+    response_parquet = admin_client.get("/academic/researchers/export?format=parquet")
+    assert response_parquet.status_code == HTTPStatus.OK
+    assert "application/vnd.apache.parquet" in response_parquet.headers["content-type"]
+    assert (
+        'attachment; filename="researchers_lattes_ids.parquet"'
+        in response_parquet.headers["content-disposition"]
+    )
+    table = pq.read_table(io.BytesIO(response_parquet.content))
+    assert table.column_names == ["lattes_id"]
+    assert table.num_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_export_researchers_csv(admin_client, researcher_generator):
+    await researcher_generator(name="Pesquisador B", lattes_id="0002000200020002")
+    await researcher_generator(name="Pesquisador A", lattes_id="0001000100010001")
+    await researcher_generator(name="Pesquisador C", lattes_id="0003000300030003")
+
+    # Via /export (padrão csv)
+    response = admin_client.get("/academic/researchers/export")
+    assert response.status_code == HTTPStatus.OK
+    assert "text/csv" in response.headers["content-type"]
+    lines = [
+        line.strip() for line in response.text.strip().splitlines() if line.strip()
+    ]
+    assert lines == [
+        "lattes_id",
+        "0001000100010001",
+        "0002000200020002",
+        "0003000300030003",
+    ]
+
+    # Via /export/csv
+    response_direct = admin_client.get("/academic/researchers/export/csv")
+    assert response_direct.status_code == HTTPStatus.OK
+    lines_direct = [
+        line.strip()
+        for line in response_direct.text.strip().splitlines()
+        if line.strip()
+    ]
+    assert lines_direct == lines
+
+
+@pytest.mark.asyncio
+async def test_export_researchers_parquet(admin_client, researcher_generator):
+    await researcher_generator(name="Pesquisador B", lattes_id="0002000200020002")
+    await researcher_generator(name="Pesquisador A", lattes_id="0001000100010001")
+
+    # Via /export?format=parquet
+    response = admin_client.get("/academic/researchers/export?format=parquet")
+    assert response.status_code == HTTPStatus.OK
+    assert "application/vnd.apache.parquet" in response.headers["content-type"]
+    table = pq.read_table(io.BytesIO(response.content))
+    assert table.column_names == ["lattes_id"]
+    assert table.column("lattes_id").to_pylist() == [
+        "0001000100010001",
+        "0002000200020002",
+    ]
+
+    # Via /export/parquet
+    response_direct = admin_client.get("/academic/researchers/export/parquet")
+    assert response_direct.status_code == HTTPStatus.OK
+    table_direct = pq.read_table(io.BytesIO(response_direct.content))
+    assert table_direct.column("lattes_id").to_pylist() == [
+        "0001000100010001",
+        "0002000200020002",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_export_researchers_filter_by_institution(
+    admin_client,
+    researcher_generator,
+    institution_generator,
+    researcher_institution_generator,
+):
+    inst1 = await institution_generator(name="Inst 1", acronym="I1")
+    inst2 = await institution_generator(name="Inst 2", acronym="I2")
+
+    r1 = await researcher_generator(name="Pesquisador 1", lattes_id="1111111111111111")
+    r2 = await researcher_generator(name="Pesquisador 2", lattes_id="2222222222222222")
+    r3 = await researcher_generator(name="Pesquisador 3", lattes_id="3333333333333333")
+
+    await researcher_institution_generator(researcher_id=r1.id, institution_id=inst1.id)
+    await researcher_institution_generator(researcher_id=r2.id, institution_id=inst2.id)
+    await researcher_institution_generator(researcher_id=r3.id, institution_id=inst1.id)
+    await researcher_institution_generator(researcher_id=r3.id, institution_id=inst2.id)
+
+    # Filtro inst1 em CSV
+    resp1 = admin_client.get(f"/academic/researchers/export?institution_id={inst1.id}")
+    assert resp1.status_code == HTTPStatus.OK
+    lines1 = [line.strip() for line in resp1.text.strip().splitlines() if line.strip()]
+    assert lines1 == ["lattes_id", "1111111111111111", "3333333333333333"]
+
+    # Filtro inst2 em Parquet
+    resp2 = admin_client.get(
+        f"/academic/researchers/export?institution_id={inst2.id}&format=parquet"
+    )
+    assert resp2.status_code == HTTPStatus.OK
+    table2 = pq.read_table(io.BytesIO(resp2.content))
+    assert table2.column("lattes_id").to_pylist() == [
+        "2222222222222222",
+        "3333333333333333",
+    ]

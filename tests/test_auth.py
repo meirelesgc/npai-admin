@@ -27,7 +27,8 @@ def test_get_token_with_username(client, user):
     assert "token_type" in token
 
 
-def test_token_expired_after_time(client, user):
+def test_token_expired_after_time(client, user, monkeypatch):
+    monkeypatch.setattr("simcc_admin.security.settings.ACCESS_TOKEN_EXPIRE_MINUTES", 30)
     with freeze_time("2023-07-14 12:00:00"):
         response = client.post(
             "/auth/token",
@@ -82,7 +83,8 @@ def test_refresh_token(client, user, token):
     assert data["token_type"] == "bearer"
 
 
-def test_token_expired_dont_refresh(client, user):
+def test_token_expired_dont_refresh(client, user, monkeypatch):
+    monkeypatch.setattr("simcc_admin.security.settings.ACCESS_TOKEN_EXPIRE_MINUTES", 30)
     with freeze_time("2023-07-14 12:00:00"):
         response = client.post(
             "/auth/token",

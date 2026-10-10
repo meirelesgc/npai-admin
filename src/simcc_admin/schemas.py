@@ -1,9 +1,15 @@
 from datetime import datetime
+from enum import Enum
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+
+class ExportFormat(str, Enum):
+    CSV = "csv"
+    PARQUET = "parquet"
 
 
 class Message(BaseModel):

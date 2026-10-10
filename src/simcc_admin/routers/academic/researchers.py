@@ -1,9 +1,14 @@
+import csv
+import io
 import time
 from http import HTTPStatus
 from typing import Annotated
 from uuid import UUID
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +23,7 @@ from simcc_admin.models import (
 )
 from simcc_admin.schemas import (
     Affiliation,
+    ExportFormat,
     FiltersApplied,
     InstitutionRef,
     Message,
@@ -128,6 +134,120 @@ async def search_researchers(
         meta=Meta(took_ms=took_ms, cached=False),
         facets=None,
         summary=None,
+    )
+
+
+def _generate_csv_stream(lattes_ids: list[str]):
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["lattes_id"])
+    yield buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate(0)
+
+    for i, lid in enumerate(lattes_ids, 1):
+        writer.writerow([lid])
+        if i % 1000 == 0:
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+
+    remaining = buffer.getvalue()
+    if remaining:
+        yield remaining
+
+
+def _build_parquet_response(lattes_ids: list[str]) -> Response:
+    table = pa.Table.from_arrays(
+        [pa.array(lattes_ids, type=pa.string())],
+        names=["lattes_id"],
+    )
+    sink = io.BytesIO()
+    pq.write_table(table, sink, compression="snappy")
+    sink.seek(0)
+    return Response(
+        content=sink.getvalue(),
+        media_type="application/vnd.apache.parquet",
+        headers={
+            "Content-Disposition": 'attachment; filename="researchers_lattes_ids.parquet"'
+        },
+    )
+
+
+async def _export_researchers_data(
+    session: AsyncSession,
+    export_format: ExportFormat,
+    institution_id: UUID | None = None,
+) -> Response:
+    query = select(Researcher.lattes_id).distinct().order_by(Researcher.lattes_id.asc())
+
+    if institution_id:
+        query = query.join(ResearcherInstitution).where(
+            ResearcherInstitution.institution_id == institution_id
+        )
+
+    result = await session.scalars(query)
+    lattes_ids = list(result.all())
+
+    if export_format == ExportFormat.PARQUET:
+        return _build_parquet_response(lattes_ids)
+
+    return StreamingResponse(
+        _generate_csv_stream(lattes_ids),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="researchers_lattes_ids.csv"'
+        },
+    )
+
+
+@router.get("/export")
+@router.get("/export/", include_in_schema=False)
+async def export_researchers(
+    session: Session,
+    format: Annotated[
+        ExportFormat,
+        Query(description="Formato de exportação: csv ou parquet"),
+    ] = ExportFormat.CSV,
+    institution_id: Annotated[
+        UUID | None, Query(description="Filtro opcional por instituição")
+    ] = None,
+):
+    """Exporta a lista de lattes_id dos pesquisadores em CSV ou Parquet."""
+    return await _export_researchers_data(
+        session=session,
+        export_format=format,
+        institution_id=institution_id,
+    )
+
+
+@router.get("/export/csv")
+async def export_researchers_csv(
+    session: Session,
+    institution_id: Annotated[
+        UUID | None, Query(description="Filtro opcional por instituição")
+    ] = None,
+):
+    """Exporta a lista de lattes_id dos pesquisadores no formato CSV."""
+    return await _export_researchers_data(
+        session=session,
+        export_format=ExportFormat.CSV,
+        institution_id=institution_id,
+    )
+
+
+@router.get("/export/parquet")
+async def export_researchers_parquet(
+    session: Session,
+    institution_id: Annotated[
+        UUID | None, Query(description="Filtro opcional por instituição")
+    ] = None,
+):
+    """Exporta a lista de lattes_id dos pesquisadores no formato Parquet."""
+    return await _export_researchers_data(
+        session=session,
+        export_format=ExportFormat.PARQUET,
+        institution_id=institution_id,
     )
 
 
